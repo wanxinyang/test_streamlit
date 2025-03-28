@@ -1,68 +1,115 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+import io
+import datetime
+import base64
+import json
 
-# Set the page title
-st.set_page_config(page_title="Basic Dashboard", # Title that appears on the browser tab
-                   layout="centered") # "wide" makes use of full browser width; alternative: "centered"
+# Storage keys for offline capability
+PROJECT_STORAGE_KEY = "tls_fieldwork_project"
 
-#### GENERATING A SIMPLE DATASET ####
-# Create a sample dataset
-np.random.seed(42)  # For reproducibility
+st.set_page_config(page_title="TLS Fieldworks", layout="wide")
+st.title("TLS Fieldwork Planner")
 
-data_db = pd.DataFrame({
-    "Category": np.random.choice(["A", "B", "C", "D"], size=100),
-    "Value": np.random.randint(10, 100, size=100),
-    "Date": pd.date_range(start="2024-01-01", periods=100, freq="D")
-})
-data_db.head()
+# Sidebar for navigation
+view = st.sidebar.radio("Navigation", ["All Field Works", "Create/Edit Field Work"])
 
-#### SETTING UP DASHBOARD LAYOUT ####
+# Load saved fieldworks from local storage
+if PROJECT_STORAGE_KEY in st.session_state:
+    field_works = st.session_state[PROJECT_STORAGE_KEY]
+else:
+    field_works = {}
 
-# Title and description
-st.title("Basic Streamlit Dashboard") # Displays a large title at the top of the app
-st.markdown("This is a very rudimentary dashboard that uses Plotly plots. You can add additional text here...") # Displays a markdown text description
+# Utility to create ID
+create_id = lambda: f"fw_{int(datetime.datetime.utcnow().timestamp())}"
 
-# Sidebar filters 
-# (1) Creates a multi-select dropdown to filter data based on category
-category_filter = st.sidebar.multiselect(
-    "Select Category", # Label shown in sidebar
-    options=data_db["Category"].unique(), # Unique categories from the dataset
-    default=data_db["Category"].unique()) # Default selection includes all categories
+def save_projects():
+    st.session_state[PROJECT_STORAGE_KEY] = field_works
 
-# (2) Creates a date range selector to filter data based on date
-date_range = st.sidebar.date_input(
-    "Select Date Range", # Label for the date input
-    [data_db["Date"].min(), data_db["Date"].max()], # Default selection is full range
-    min_value=data_db["Date"].min(), # Minimum selectable date
-    max_value=data_db["Date"].max() # Maximum selectable date
-)
+def export_csv(data, filename):
+    csv = data.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode()).decode()  # B64 encode
+    href = f'<a href="data:file/csv;base64,{b64}" download="{filename}">Download CSV</a>'
+    return href
 
-# Filter the dataset based on sidebar inputs
-filtered_data = data_db[
-    (data_db["Category"].isin(category_filter)) & # Filters rows where category is in the selected list
-    (data_db["Date"] >= pd.to_datetime(date_range[0])) & # Filters rows where date is greater than or equal to start date
-    (data_db["Date"] <= pd.to_datetime(date_range[1])) # Filters rows where date is less than or equal to end date
-]
+if view == "All Field Works":
+    st.subheader("All Field Works")
+    if not field_works:
+        st.info("No field works created yet.")
+    else:
+        for fw_id, fw in field_works.items():
+            with st.expander(f"{fw['projectName']} ({fw_id})"):
+                st.write(f"Plot Size: {fw['width']} x {fw['length']} m")
+                st.write(f"Grid Size: {fw['gridSize']} m")
+                st.markdown(export_csv(pd.DataFrame(fw['points']), f"{fw['projectName']}_{fw_id}.csv"), unsafe_allow_html=True)
+                if st.button("Edit", key=f"edit_{fw_id}"):
+                    st.session_state['edit_fw_id'] = fw_id
+                    st.experimental_rerun()
+                if st.button("Delete", key=f"delete_{fw_id}"):
+                    field_works.pop(fw_id)
+                    save_projects()
+                    st.success("Deleted successfully.")
+                    st.experimental_rerun()
 
-#### PLOTS WITH PLOTLY ####
+if view == "Create/Edit Field Work":
+    st.subheader("Create or Edit Field Work")
+    editing = 'edit_fw_id' in st.session_state
+    fw_data = field_works[st.session_state['edit_fw_id']] if editing else {}
+    
+    with st.form("field_form"):
+        project_name = st.text_input("Project Name", value=fw_data.get("projectName", ""))
+        width = st.number_input("Plot width (x, m)", value=fw_data.get("width", 0.0))
+        length = st.number_input("Plot length (y, m)", value=fw_data.get("length", 0.0))
+        grid_size = st.number_input("Grid Size (m)", value=fw_data.get("gridSize", 1.0))
+        prefix = st.text_input("Prefix", value=fw_data.get("prefix", "ScanPos"))
+        submitted = st.form_submit_button("Generate Grid")
 
-# Plot 1: bar chart to show the average value for each category
-fig_bar = px.bar(filtered_data.groupby("Category")["Value"].mean().reset_index(),
-                 x="Category", y="Value", title="Average Value by Category",
-                 color="Category", text_auto=True)
-st.plotly_chart(fig_bar, theme="streamlit", use_container_width=True) # Display the bar chart with full width
+    if submitted:
+        points = []
+        count = 1
+        for i in range(int(width // grid_size) + 1):
+            x = i * grid_size
+            for j in range(int(length // grid_size) + 1):
+                y = j * grid_size
+                points.append({
+                    "x": x,
+                    "y": y,
+                    "upright": f"{prefix}{str(count).zfill(3)}",
+                    "tilt": f"{prefix}{str(count + 1).zfill(3)}",
+                    "complete": False,
+                    "completeTimestamp": "",
+                    "notes": ""
+                })
+                count += 2
 
-#Plot 2: line chart to show the trend of values over time
-fig_line = px.line(filtered_data, x="Date", y="Value", title="Value Trend Over Time", markers=True)
-st.plotly_chart(fig_line, theme="streamlit", use_container_width=True) # Display the line chart
+        fw_id = st.session_state['edit_fw_id'] if editing else create_id()
+        field_works[fw_id] = {
+            "id": fw_id,
+            "projectName": project_name,
+            "width": width,
+            "length": length,
+            "gridSize": grid_size,
+            "prefix": prefix,
+            "points": points
+        }
+        save_projects()
+        st.success("Grid generated and field work saved.")
+        st.session_state.pop('edit_fw_id', None)
+        st.experimental_rerun()
 
-#Plot 3: box plot to show the distribution of values by category
-fig_box = px.box(filtered_data, x="Category", y="Value", title="Value Distribution by Category")
-st.plotly_chart(fig_box, theme="streamlit", use_container_width=True) # Display the box plot
+    if editing:
+        points_df = pd.DataFrame(fw_data["points"])
+        edited_df = st.data_editor(points_df, num_rows="dynamic", use_container_width=True)
+        if st.button("Save Changes"):
+            field_works[st.session_state['edit_fw_id']]['points'] = edited_df.to_dict(orient="records")
+            save_projects()
+            st.success("Changes saved.")
 
-#Plot 4: scatter plot to show value distribution over time
-fig_scatter = px.scatter(filtered_data, x="Date", y="Value", color="Category",
-                         title="Scatter Plot of Value Over Time", size_max=10)
-st.plotly_chart(fig_scatter, theme="streamlit", use_container_width=True) # Display the box plot
+        st.markdown(export_csv(edited_df, f"{fw_data['projectName']}_{fw_data['id']}.csv"), unsafe_allow_html=True)
+
+        # Simple visualisation
+        st.subheader("Scan Point Visualisation")
+        import plotly.express as px
+        fig = px.scatter(edited_df, x="x", y="y", color=edited_df["complete"].map(lambda x: "Complete" if x else "Incomplete"))
+        st.plotly_chart(fig, use_container_width=True)
